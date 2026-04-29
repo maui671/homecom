@@ -9,7 +9,7 @@ SERVICE_FILE="/etc/systemd/system/homecom.service"
 DEFAULT_PORT="443"
 
 if [[ $EUID -ne 0 ]]; then
-  echo "Run as root: sudo bash install-homecom.sh"
+  echo "Run as root: sudo bash install.sh"
   exit 1
 fi
 
@@ -80,7 +80,7 @@ from fastapi import FastAPI, Form, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-APP_DIR = Path("/opt/homecom")
+APP_DIR = Path(os.environ.get("HOMECOM_APP_DIR", "/opt/homecom"))
 DATA_DIR = APP_DIR / "data"
 USERS_FILE = DATA_DIR / "users.json"
 SECRET_FILE = DATA_DIR / "secret.key"
@@ -367,8 +367,9 @@ cat > "$APP_DIR/static/index.html" <<'HTML'
 
     <section class="card">
       <h2>Audio</h2>
-      <p>Tap Join once on each device to allow microphone and speaker playback.</p>
+      <p id="browserHelp">Tap Join once on each device to allow microphone and speaker playback.</p>
       <button id="join">Join Intercom</button>
+      <p id="audioState">Audio not joined.</p>
     </section>
   </main>
 
@@ -420,6 +421,10 @@ header h1 {
 
 #status, .card p, label {
   color: var(--muted);
+}
+
+#audioState {
+  font-weight: 700;
 }
 
 main {
@@ -528,6 +533,7 @@ let joined = false;
 let peers = new Map();
 let peerNames = new Map();
 let talking = false;
+let audioCtx = null;
 
 const statusEl = document.getElementById("status");
 const peersEl = document.getElementById("peers");
@@ -535,9 +541,91 @@ const ptt = document.getElementById("ptt");
 const joinBtn = document.getElementById("join");
 const talkerEl = document.getElementById("talker");
 const audioRoot = document.getElementById("audio");
+const audioStateEl = document.getElementById("audioState");
+const browserHelpEl = document.getElementById("browserHelp");
+
+function isiOS() {
+  return /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+}
+
+function isChromeiOS() {
+  return /CriOS/.test(navigator.userAgent);
+}
 
 function setStatus(text) {
   statusEl.textContent = text;
+}
+
+function setAudioState(text) {
+  audioStateEl.textContent = text;
+}
+
+function setBrowserHelp() {
+  if (isChromeiOS()) {
+    browserHelpEl.textContent =
+      "Chrome on iOS can block microphone/WebRTC on self-signed local HTTPS. Safari is recommended after installing and trusting the HomeCom certificate.";
+  } else if (isiOS()) {
+    browserHelpEl.textContent =
+      "On iOS Safari, tap Join once, allow microphone access, and keep the HomeCom certificate fully trusted.";
+  }
+}
+
+function micErrorMessage(err) {
+  const base = err && err.message ? err.message : String(err);
+
+  if (!window.isSecureContext) {
+    return "Browser says this is not a secure context. Install/trust the HomeCom certificate and reload HTTPS.";
+  }
+
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    return "This browser does not expose microphone access here. On iOS, use Safari with the certificate installed and fully trusted.";
+  }
+
+  if (isChromeiOS()) {
+    return `Chrome iOS blocked microphone/WebRTC in this context. Use Safari after installing/trusting the HomeCom certificate. Browser said: ${base}`;
+  }
+
+  if (isiOS()) {
+    return `iOS blocked microphone access. Confirm Safari has microphone permission and the HomeCom certificate is fully trusted. Browser said: ${base}`;
+  }
+
+  return `Could not join intercom: ${base}`;
+}
+
+async function unlockIOSAudio() {
+  try {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (AudioContextClass) {
+      audioCtx = audioCtx || new AudioContextClass();
+      if (audioCtx.state === "suspended") {
+        await audioCtx.resume();
+      }
+
+      const buffer = audioCtx.createBuffer(1, 1, 22050);
+      const source = audioCtx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(audioCtx.destination);
+      source.start(0);
+    }
+  } catch (e) {
+    console.warn("AudioContext unlock failed:", e);
+  }
+
+  try {
+    const tmp = document.createElement("audio");
+    tmp.setAttribute("playsinline", "true");
+    tmp.playsInline = true;
+    tmp.muted = true;
+    tmp.autoplay = true;
+    tmp.src =
+      "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=";
+    document.body.appendChild(tmp);
+    await tmp.play().catch(() => {});
+    setTimeout(() => tmp.remove(), 500);
+  } catch (e) {
+    console.warn("HTMLAudio unlock failed:", e);
+  }
 }
 
 function renderPeers(peerList) {
@@ -557,20 +645,31 @@ function ensureAudio(peerId, stream) {
     audio.id = `audio-${peerId}`;
     audio.autoplay = true;
     audio.playsInline = true;
+    audio.setAttribute("playsinline", "true");
+    audio.controls = false;
     audioRoot.appendChild(audio);
   }
+
   audio.srcObject = stream;
-  audio.play().catch(() => {});
+  audio.muted = false;
+  audio.volume = 1.0;
+
+  const playPromise = audio.play();
+  if (playPromise && typeof playPromise.catch === "function") {
+    playPromise
+      .then(() => setAudioState("Remote audio active."))
+      .catch(err => {
+        console.warn("Audio play blocked:", err);
+        setAudioState("Remote audio is connected but playback was blocked. Tap Join again or tap the page once.");
+      });
+  }
 }
 
-async function createPeerConnection(peerId, polite = false) {
+async function createPeerConnection(peerId) {
   if (peerId === myId) return null;
   if (peers.has(peerId)) return peers.get(peerId);
 
-  const pc = new RTCPeerConnection({
-    iceServers: []
-  });
-
+  const pc = new RTCPeerConnection({ iceServers: [] });
   peers.set(peerId, pc);
 
   if (localStream) {
@@ -592,6 +691,7 @@ async function createPeerConnection(peerId, polite = false) {
   };
 
   pc.onconnectionstatechange = () => {
+    setAudioState(`Peer ${peerNames.get(peerId) || peerId}: ${pc.connectionState}`);
     if (["failed", "closed", "disconnected"].includes(pc.connectionState)) {
       peers.delete(peerId);
     }
@@ -614,7 +714,7 @@ async function callPeer(peerId) {
 }
 
 async function handleOffer(msg) {
-  const pc = await createPeerConnection(msg.source, true);
+  const pc = await createPeerConnection(msg.source);
   await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
   const answer = await pc.createAnswer();
   await pc.setLocalDescription(answer);
@@ -646,6 +746,16 @@ async function handleCandidate(msg) {
 async function joinIntercom() {
   if (joined) return;
 
+  if (!window.isSecureContext) {
+    throw new Error("Not a secure context. Certificate must be installed and trusted.");
+  }
+
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    throw new Error("getUserMedia unavailable in this browser/context.");
+  }
+
+  await unlockIOSAudio();
+
   localStream = await navigator.mediaDevices.getUserMedia({
     audio: {
       echoCancellation: true,
@@ -656,14 +766,23 @@ async function joinIntercom() {
   });
 
   localStream.getAudioTracks().forEach(track => {
-    track.enabled = false;
+    track.enabled = true;
   });
+
+  setTimeout(() => {
+    if (!talking && localStream) {
+      localStream.getAudioTracks().forEach(track => {
+        track.enabled = false;
+      });
+    }
+  }, 350);
 
   joined = true;
   ptt.disabled = false;
-  joinBtn.disabled = true;
-  joinBtn.textContent = "Joined";
+  joinBtn.disabled = false;
+  joinBtn.textContent = "Audio Joined";
   setStatus(`Connected as ${myName}`);
+  setAudioState("Audio joined. Hold Push to Talk to transmit.");
 
   for (const peerId of peerNames.keys()) {
     if (peerId !== myId) {
@@ -736,7 +855,7 @@ function startTalking() {
   localStream.getAudioTracks().forEach(track => {
     track.enabled = true;
   });
-  ws.send(JSON.stringify({type: "talk-request"}));
+  ws.send(JSON.stringify({ type: "talk-request" }));
 }
 
 function stopTalkingLocalOnly() {
@@ -753,14 +872,21 @@ function stopTalkingLocalOnly() {
 function stopTalking() {
   if (!talking) return;
   stopTalkingLocalOnly();
-  ws.send(JSON.stringify({type: "talk-stop"}));
+  ws.send(JSON.stringify({ type: "talk-stop" }));
 }
 
-joinBtn.addEventListener("click", () => {
-  joinIntercom().catch(err => {
-    alert(`Could not join intercom: ${err.message}`);
-  });
+joinBtn.addEventListener("click", async () => {
+  try {
+    await joinIntercom();
+  } catch (err) {
+    const msg = micErrorMessage(err);
+    setAudioState(msg);
+    alert(msg);
+  }
 });
+
+document.addEventListener("touchstart", unlockIOSAudio, { once: false, passive: true });
+document.addEventListener("pointerdown", unlockIOSAudio, { once: false });
 
 ptt.addEventListener("pointerdown", event => {
   event.preventDefault();
@@ -777,6 +903,7 @@ ptt.addEventListener("pointerleave", stopTalking);
 
 window.addEventListener("beforeunload", stopTalking);
 
+setBrowserHelp();
 connectWs();
 JS
 
@@ -811,11 +938,22 @@ if [[ ! -f "$APP_DIR/data/secret.key" ]]; then
   openssl rand -hex 64 > "$APP_DIR/data/secret.key"
 fi
 
+IP_ADDR="$(hostname -I | awk '{print $1}')"
+
+SAN_LIST="DNS:${CERT_HOSTNAME},DNS:homecom.local,DNS:homecom,IP:127.0.0.1"
+if [[ -n "$IP_ADDR" ]]; then
+  SAN_LIST="${SAN_LIST},IP:${IP_ADDR}"
+fi
+
+if [[ "$CERT_HOSTNAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  SAN_LIST="${SAN_LIST},IP:${CERT_HOSTNAME}"
+fi
+
 openssl req -x509 -newkey rsa:4096 -sha256 -days 3650 -nodes \
   -keyout "$APP_DIR/certs/homecom.key" \
   -out "$APP_DIR/certs/homecom.crt" \
   -subj "/CN=$CERT_HOSTNAME" \
-  -addext "subjectAltName=DNS:$CERT_HOSTNAME,IP:127.0.0.1" >/dev/null 2>&1
+  -addext "subjectAltName=${SAN_LIST}" >/dev/null 2>&1
 
 cat > "$SERVICE_FILE" <<EOF
 [Unit]
@@ -828,6 +966,7 @@ Type=simple
 User=$APP_USER
 Group=$APP_GROUP
 WorkingDirectory=$APP_DIR
+Environment=HOMECOM_APP_DIR=$APP_DIR
 ExecStart=$APP_DIR/venv/bin/uvicorn server:app --host 0.0.0.0 --port $PORT --ssl-keyfile $APP_DIR/certs/homecom.key --ssl-certfile $APP_DIR/certs/homecom.crt
 Restart=always
 RestartSec=3
@@ -836,6 +975,8 @@ PrivateTmp=true
 ProtectSystem=full
 ProtectHome=true
 ReadWritePaths=$APP_DIR
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
 
 [Install]
 WantedBy=multi-user.target
@@ -843,21 +984,44 @@ EOF
 
 chown -R "$APP_USER:$APP_GROUP" "$APP_DIR"
 chmod 600 "$APP_DIR/data/secret.key" "$APP_DIR/data/users.json" "$APP_DIR/certs/homecom.key"
-chmod 644 "$APP_DIR/certs/homecom.crt"
+chmod 644 "$APP_DIR/certs/homecom.crt" "$APP_DIR/certs/homecom.cer"
 
 if command -v ufw >/dev/null 2>&1; then
   ufw allow "$PORT/tcp" || true
+  ufw allow 8000/tcp || true
 fi
 
+systemctl daemon-reexec
 systemctl daemon-reload
 systemctl enable --now homecom.service
-
-IP_ADDR="$(hostname -I | awk '{print $1}')"
+systemctl restart homecom.service
 
 echo
 echo "HomeCom installed."
 echo "URL: https://${IP_ADDR}:${PORT}"
 echo "Login: ${ADMIN_USER}"
+echo
+echo "iOS certificate install:"
+echo "  1. On the Pi, run:"
+echo "       cd $APP_DIR/certs"
+echo "       python3 -m http.server 8000"
+echo
+echo "  2. On the iPhone/iPad, open Safari only:"
+echo "       http://${IP_ADDR}:8000/homecom.crt"
+echo
+echo "  3. Install the downloaded profile:"
+echo "       Settings -> General -> VPN & Device Management"
+echo
+echo "  4. Fully trust it:"
+echo "       Settings -> General -> About -> Certificate Trust Settings"
+echo
+echo "  5. Then open:"
+echo "       https://${IP_ADDR}:${PORT}"
+echo
+echo "Notes:"
+echo "  - Safari on iOS is the supported mobile browser."
+echo "  - Chrome on iOS may still block WebRTC/mic access with self-signed local certs."
+echo "  - If Chrome iOS fails, use Safari after fully trusting the cert."
 echo
 echo "Service commands:"
 echo "  systemctl status homecom --no-pager"
